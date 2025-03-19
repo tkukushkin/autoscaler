@@ -18,7 +18,7 @@ package routines
 
 import (
 	"context"
-	"flag"
+	"sync"
 	"time"
 
 	"k8s.io/klog/v2"
@@ -31,11 +31,6 @@ import (
 	controllerfetcher "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target/controller_fetcher"
 	metrics_recommender "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/metrics/recommender"
 	vpa_utils "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/vpa"
-)
-
-var (
-	checkpointsWriteTimeout = flag.Duration("checkpoints-timeout", time.Minute, `Timeout for writing checkpoints since the start of the recommender's main loop`)
-	minCheckpointsPerRun    = flag.Int("min-checkpoints", 10, "Minimum number of checkpoints to write per recommender's main loop")
 )
 
 // Recommender recommend resources for certain containers, based on utilization periodically got from metrics api.
@@ -51,7 +46,7 @@ type Recommender interface {
 	// MaintainCheckpoints stores current checkpoints in API Server and garbage collect old ones
 	// MaintainCheckpoints writes at least minCheckpoints if there are more checkpoints to write.
 	// Checkpoints are written until ctx permits or all checkpoints are written.
-	MaintainCheckpoints(ctx context.Context, minCheckpoints int)
+	MaintainCheckpoints()
 }
 
 type recommender struct {
@@ -80,6 +75,8 @@ func (r *recommender) GetClusterStateFeeder() input.ClusterStateFeeder {
 func (r *recommender) UpdateVPAs() {
 	cnt := metrics_recommender.NewObjectCounter()
 	defer cnt.Observe()
+
+	var wg sync.WaitGroup
 
 	for _, observedVpa := range r.clusterState.ObservedVpas {
 		key := model.VpaID{
@@ -118,20 +115,24 @@ func (r *recommender) UpdateVPAs() {
 		}
 		cnt.Add(vpa)
 
-		_, err := vpa_utils.UpdateVpaStatusIfNeeded(
-			r.vpaClient.VerticalPodAutoscalers(vpa.ID.Namespace), vpa.ID.VpaName, vpa.AsStatus(), &observedVpa.Status)
-		if err != nil {
-			klog.ErrorS(err, "Cannot update VPA", "vpa", klog.KRef(vpa.ID.Namespace, vpa.ID.VpaName))
-		}
+		wg.Add(1)
+
+		go (func() {
+			defer wg.Done()
+			_, err := vpa_utils.UpdateVpaStatusIfNeeded(
+				r.vpaClient.VerticalPodAutoscalers(vpa.ID.Namespace), vpa.ID.VpaName, vpa.AsStatus(), &observedVpa.Status)
+			if err != nil {
+				klog.ErrorS(err, "Cannot update VPA", "vpa", klog.KRef(vpa.ID.Namespace, vpa.ID.VpaName))
+			}
+		})()
 	}
+	wg.Wait()
 }
 
-func (r *recommender) MaintainCheckpoints(ctx context.Context, minCheckpointsPerRun int) {
+func (r *recommender) MaintainCheckpoints() {
 	now := time.Now()
 	if r.useCheckpoints {
-		if err := r.checkpointWriter.StoreCheckpoints(ctx, now, minCheckpointsPerRun); err != nil {
-			klog.V(0).InfoS("Failed to store checkpoints", "err", err)
-		}
+		r.checkpointWriter.StoreCheckpoints(now)
 		if time.Since(r.lastCheckpointGC) > r.checkpointsGCInterval {
 			r.lastCheckpointGC = now
 			r.clusterStateFeeder.GarbageCollectCheckpoints()
@@ -160,9 +161,7 @@ func (r *recommender) RunOnce() {
 	r.UpdateVPAs()
 	timer.ObserveStep("UpdateVPAs")
 
-	stepCtx, cancelFunc := context.WithDeadline(ctx, time.Now().Add(*checkpointsWriteTimeout))
-	defer cancelFunc()
-	r.MaintainCheckpoints(stepCtx, *minCheckpointsPerRun)
+	r.MaintainCheckpoints()
 	timer.ObserveStep("MaintainCheckpoints")
 
 	r.clusterState.RateLimitedGarbageCollectAggregateCollectionStates(ctx, time.Now(), r.controllerFetcher)
